@@ -1,4 +1,4 @@
-# LoopFormer: Elastic-Depth Looped Transformers for Latent Reasoning via Shortcut Modulation
+# LoopFormer: Elastic-Depth Looped Transformers for Latent Reasoning via Shortcut Modulation (ICLR 2026)
 
 <a target="_blank" href="">
   <img style="height:22pt" src="https://img.shields.io/badge/-Paper-red?style=flat&logo=arxiv">
