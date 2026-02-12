@@ -81,77 +81,35 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class LoopFormerBlock(nn.Module):
+class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.norm_1 = nn.RMSNorm(config.n_embd, elementwise_affine=False)
+        self.norm_1 = nn.RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.norm_2 = nn.RMSNorm(config.n_embd, elementwise_affine=False)
-        self.mlp  = MLP(config)
+        self.norm_2 = nn.RMSNorm(config.n_embd)
+        self.mlp = MLP(config)
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(config.n_embd, 4 * config.n_embd, bias=True),
-        )
-
-        nn.init.zeros_(self.adaLN_modulation[1].weight)
-        nn.init.zeros_(self.adaLN_modulation[1].bias)
-
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        gate_msa, gate_mlp, scale_msa, scale_mlp = self.adaLN_modulation(c).chunk(4, dim=1)
-
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            self.norm_1(x) * (1 + scale_msa.unsqueeze(1))
-        )
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            self.norm_2(x) * (1 + scale_mlp.unsqueeze(1))
-        )
+    def forward(self, x):
+        x = x + self.attn(self.norm_1(x))
+        x = x + self.mlp(self.norm_2(x))
         return x
-
-class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
-            device=t.device
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_freq = t_freq.to(dtype=self.mlp[0].weight.dtype)
-        t_emb = self.mlp(t_freq)
-        return t_emb
 
 class SharedBlock(nn.Module):
     def __init__(self, depth, config):
         super().__init__()
         self.blocks = nn.ModuleList([
-            LoopFormerBlock(config) for _ in range(depth)
+            Block(config) for _ in range(depth)
         ])
 
-    def forward(self, x, c):
+    def forward(self, x):
         for block in self.blocks:
-            x = block(x, c)
+            x = block(x)
         return x
 
 @dataclass
 class GPTConfig:
-    model_type: str = 'loopformer'
+    model_type: str = 'base_loop'
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 3
@@ -176,10 +134,6 @@ class GPT(nn.Module):
             h = SharedBlock(config.n_layer, config),
             norm_f = nn.RMSNorm(config.n_embd),
         ))
-
-        self.time_embedder = TimestepEmbedder(config.n_embd)
-        self.dt_embedder = TimestepEmbedder(config.n_embd)
-
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -217,25 +171,18 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, steps=[1/8]*8):
+    def forward(self, idx, targets=None, steps=8):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t) 
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-
-        ti = torch.zeros(x.shape[0], dtype=x.dtype).to(x.device)
-        for dt in steps:
-            dt_base = torch.ones_like(ti) * dt
-            te = self.time_embedder(ti)
-            dte = self.dt_embedder(dt_base)
-            c = te + dte
-            x = self.transformer.h(x, c)
-            ti = ti + dt
+        for _ in range(steps):
+            x = self.transformer.h(x)
 
         x = self.transformer.norm_f(x)
 
@@ -262,60 +209,135 @@ class GPT(nn.Module):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+    def from_pretrained(cls, model_path, config=None):
+        """
+        Load *this* GPT implementation from either:
+        (A) a local .pt/.pth checkpoint (torch.save), or
+        (B) a HuggingFace repo/local dir (AutoConfig + AutoModelForCausalLM)
 
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        - config: optional GPTConfig or dict to override/define architecture.
+        """
+        KEEP = ["model_type", "block_size", "vocab_size", "n_layer", "n_head", "n_embd",
+                "dropout", "bias", "intermediate_dim"]
 
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
+        def _as_dict(cfg_like):
+            if cfg_like is None:
+                return {}
+            if isinstance(cfg_like, GPTConfig):
+                return cfg_like.__dict__.copy()
+            if isinstance(cfg_like, dict):
+                return cfg_like.copy()
+            raise TypeError("config must be None, a GPTConfig, or a dict")
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+        def _strip_prefixes(sd, prefixes=("gpt.", "model.", "module.")):
+            out = {}
+            for k, v in sd.items():
+                kk = k
+                changed = True
+                while changed:
+                    changed = False
+                    for p in prefixes:
+                        if kk.startswith(p):
+                            kk = kk[len(p):]
+                            changed = True
+                out[kk] = v
+            return out
 
+        def _unwrap_state_dict(obj):
+            # supports common checkpoint wrappers
+            if isinstance(obj, dict):
+                for key in ("model", "state_dict", "model_state_dict"):
+                    if key in obj and isinstance(obj[key], dict):
+                        return obj[key]
+            return obj  # assume it's already a state_dict
+
+        def _fix_tied(sd):
+            # be tolerant if only one side of tied weights was saved
+            if "lm_head.weight" not in sd and "transformer.wte.weight" in sd:
+                sd["lm_head.weight"] = sd["transformer.wte.weight"]
+            if "transformer.wte.weight" not in sd and "lm_head.weight" in sd:
+                sd["transformer.wte.weight"] = sd["lm_head.weight"]
+            return sd
+
+        # --------------------------
+        # (A) Local checkpoint
+        # --------------------------
+        if str(model_path).endswith((".pt", ".pth")):
+            ckpt = torch.load(model_path, map_location="cpu")
+            sd = _unwrap_state_dict(ckpt)
+            sd = _strip_prefixes(sd)
+            sd = _fix_tied(sd)
+
+            # "sample from GPTConfig" defaults, then overwrite with user config (if given)
+            base = GPTConfig().__dict__.copy()
+            base.update(_as_dict(config))
+            gcfg = GPTConfig(**base)
+
+            model = cls(gcfg)
+            model.load_state_dict(sd, strict=True)
+            model.eval()
+            return model
+
+        # --------------------------
+        # (B) HuggingFace model id/dir
+        # --------------------------
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        hf_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=hf_cfg,
+            trust_remote_code=True,
+            torch_dtype="auto",
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
+
+        # Extract core config fields from HF config with a few robust fallbacks
+        def _get(name, *alts, default=None):
+            for n in (name, *alts):
+                if hasattr(hf_cfg, n):
+                    v = getattr(hf_cfg, n)
+                    if v is not None:
+                        return v
+            return default
+
+        core_config = {
+            # note: model_type is optional; keep it if present
+            "model_type": _get("model_type", default=None),
+
+            "block_size": _get("block_size", "n_positions", "max_position_embeddings"),
+            "vocab_size": _get("vocab_size"),
+
+            "n_layer": _get("n_layer", "num_hidden_layers"),
+            "n_head": _get("n_head", "num_attention_heads"),
+            "n_embd": _get("n_embd", "hidden_size"),
+
+            "dropout": _get("dropout", "resid_pdrop", default=0.0),
+            "bias": _get("bias", default=False),
+
+            # prefer explicit intermediate_dim, else n_inner, else 4*n_embd
+            "intermediate_dim": _get("intermediate_dim", "n_inner", default=None),
+        }
+
+        if core_config["intermediate_dim"] is None:
+            core_config["intermediate_dim"] = 4 * int(core_config["n_embd"])
+
+        # Only keep keys you asked for (and that are not None)
+        core_config = {k: v for k, v in core_config.items() if k in KEEP and v is not None}
+
+        # Overwrite with provided config (if any)
+        core_config.update(_as_dict(config))
+
+        gcfg = GPTConfig(**core_config)
+        model = cls(gcfg)
+
+        sd = hf_model.state_dict()
+        sd = _strip_prefixes(sd)
+        sd = _fix_tied(sd)
+
+        model.load_state_dict(sd, strict=True)
+        model.eval()
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):

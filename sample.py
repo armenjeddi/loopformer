@@ -6,11 +6,13 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from model import GPTConfig, GPT
+from dataclasses import asdict
 
 # -----------------------------------------------------------------------------
+model_type = "loopformer"
+max_model_loops = 8
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
+out_dir = 'runs/loopformer_3blk/' # ignored if init_from is not 'resume'
 start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -22,6 +24,16 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = False # use PyTorch 2.0 to compile the model to be faster
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
+
+### modified imports
+if model_type == "loopformer":
+    from models.loopformer import GPTConfig, GPT
+elif "tmlt" in model_type:
+    from models.tmlt import GPTConfig, GPT
+elif "base-loop" in model_type:
+    from models.base_loop import GPTConfig, GPT
+elif model_type == "base":
+    from models.base import GPTConfig, GPT
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
@@ -35,8 +47,9 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    gptconf = GPTConfig(**checkpoint['model_args'])
+    checkpoint = torch.load(ckpt_path, weights_only=False, map_location=device)
+    model_cfg = asdict(checkpoint['config'])
+    gptconf = GPTConfig(**model_cfg)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
@@ -44,9 +57,10 @@ if init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-elif init_from.startswith('gpt2'):
+elif init_from.startswith('gpt2'): # TODO load loopformer
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+
 
 model.eval()
 model.to(device)
@@ -55,8 +69,8 @@ if compile:
 
 # look for the meta pickle in case it is available in the dataset folder
 load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
+if init_from == 'resume' and 'config' in checkpoint and 'dataset' in model_cfg: # older checkpoints might not have these...
+    meta_path = os.path.join('data', model_cfg['dataset'], 'meta.pkl')
     load_meta = os.path.exists(meta_path)
 if load_meta:
     print(f"Loading meta from {meta_path}...")

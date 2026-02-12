@@ -24,11 +24,11 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-
-from model import GPTConfig, GPT
-
+## new import
+from utils import build_loader, seed_everything, sample_short_trajectory
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -71,12 +71,27 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
+
+### added configs
+model_type = "loopformer"
+max_model_loops = 8
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+### modified imports
+if model_type == "loopformer":
+    from models.loopformer import GPTConfig, GPT
+elif "tmlt" in model_type:
+    from models.tmlt import GPTConfig, GPT
+elif "base_loop" in model_type:
+    from models.base_loop import GPTConfig, GPT
+elif model_type == "base":
+    from models.base import GPTConfig, GPT
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -111,29 +126,45 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
+############################## data loaders instead of "poor man's data loader" ##############################
+TRAIN_SEED = 1337 + seed_offset
+VAL_SEED = 42 + seed_offset
+seed_everything(TRAIN_SEED)
+
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+train_loader = build_loader(
+    data_dir,
+    'train',
+    block_size=block_size,
+    batch_size=batch_size,
+    mode='permuted',  # or 'permuted' for random
+    stride=block_size,  # or a different stride for overlapping
+    seed=TRAIN_SEED,
+    num_workers=4,
+    persistent_workers=True,
+    drop_last=True
+)
+val_loader = build_loader(
+    data_dir,
+    'train',
+    block_size=block_size,
+    batch_size=batch_size,
+    mode='permuted',
+    stride=block_size,
+    seed=VAL_SEED,
+    num_workers=4,
+    persistent_workers=True,
+    drop_last=True
+)
+train_iter = iter(train_loader)
+val_iter = iter(val_loader)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
+val_iter_num = 0
 best_val_loss = 1e9
 
+############################################################
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
 meta_vocab_size = None
@@ -159,7 +190,7 @@ elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, weights_only=False, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
@@ -177,15 +208,15 @@ elif init_from == 'resume':
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
+    val_iter_num = checkpoint['val_iter_num']
     best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
+
+    ### Make sure train loader is at the right batch 
+    for _ in range(iter_num * gradient_accumulation_steps):
+        next(train_iter)
+
+    for _ in range(val_iter_num):
+        next(val_iter)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -214,16 +245,27 @@ if ddp:
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
-    out = {}
     model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
+
+    if model_type == 'loopformer':
+        eval_steps = [1/max_model_loops] * max_model_loops
+    else:
+        eval_steps = max_model_loops
+
+    losses = []
+    for k in range(eval_iters):
+        X, Y = next(val_iter)
+        X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
+
+        with ctx:
+            if model_type == 'base':
                 logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+            else:
+                logits, loss, _ = model(X, Y, eval_steps)
+        losses.append(loss.item())
+
+    out = np.mean(losses)
+
     model.train()
     return out
 
@@ -247,7 +289,8 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = next(train_iter)
+X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -262,29 +305,30 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        val_iter_num += eval_iters
+
+        print(f"step {iter_num}: val loss {losses:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "val/loss": losses,
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        if losses < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
+                    'val_iter_num': val_iter_num,
                     'best_val_loss': best_val_loss,
-                    'config': config,
+                    'config': gptconf,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
+                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt')) 
+    if eval_only:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
@@ -297,10 +341,31 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            if model_type == 'loopformer':
+                long_trajectory = [1/max_model_loops] * max_model_loops
+                short_trajectory = sample_short_trajectory(max_model_loops)
+                logits1, loss1, x1 = model(X, Y, long_trajectory)
+                logits2, loss2, x2 = model(X, Y, short_trajectory)
+
+                loss_ntp = loss1 + 0.1 * loss2 
+                loss_consistency = F.mse_loss(x1.detach(), x2)
+                loss = loss_ntp + 0.1 * loss_consistency
+            elif 'tmlt' in model_type or 'base_loop':
+                logits1, loss, x1 = model(X, Y, steps=max_model_loops)
+                if 'ee' in model_type: # in early-exit mode
+                    short_loops = random.randint(1,max_model_loops-1)
+                    logits2, loss2, x2 = model(X, Y, steps=short_loops)
+
+                    loss_ntp = loss + 0.1 * loss2 
+                    loss_consistency = F.mse_loss(x1.detach(), x2)
+                    loss = loss_ntp + 0.1 * loss_consistency
+            else: # base GPT model
+                logits, loss = model(X, Y)
+
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y = next(train_iter)
+        X, Y = X.to(device, non_blocking=True), Y.to(device, non_blocking=True)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
