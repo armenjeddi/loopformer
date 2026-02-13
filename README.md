@@ -29,3 +29,17 @@ The codebase is a fork of **NanoGPT**, and we intentionally keep it as close as 
 ```bash
 pip install torch numpy transformers datasets tiktoken wandb tqdm
 
+
+## Citation
+If you find this work useful, please give us a citation:
+```bibtex
+@misc{jeddi2026loopformerelasticdepthloopedtransformers,
+      title={LoopFormer: Elastic-Depth Looped Transformers for Latent Reasoning via Shortcut Modulation}, 
+      author={Ahmadreza Jeddi and Marco Ciccone and Babak Taati},
+      year={2026},
+      eprint={2602.11451},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2602.11451}, 
+}
+```
