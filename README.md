@@ -28,7 +28,7 @@ The codebase is a fork of **NanoGPT**, and we intentionally keep it as close as 
 
 ```bash
 pip install torch numpy transformers datasets tiktoken wandb tqdm
-
+```
 
 ## Citation
 If you find this work useful, please give us a citation:
